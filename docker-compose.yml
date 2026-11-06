@@ -1,0 +1,29 @@
+services:
+  crosspoint-sync:
+    image: ghcr.io/crosspoint-reader/crosspoint-sync:main
+    container_name: crosspoint-sync
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8088}:8080"
+    environment:
+      - PORT=8080
+      - LISTEN_ADDRESS=::
+      - NODE_ENV=production
+      - DATABASE_PATH=/data/crosspoint.db
+      - TOKEN_ENC_KEY=${TOKEN_ENC_KEY}
+      - TRUST_PROXY=true
+      - REGISTRATION_DISABLED=false
+      - READWISE_RATE_COOLDOWN_MS=${READWISE_RATE_COOLDOWN_MS:-10000}
+      - READWISE_MATCH_THRESHOLD=${READWISE_MATCH_THRESHOLD:-0.7}
+    volumes:
+      - ${APP_DATA_DIR:-./data}:/data
+      # Mount enhanced 2-way sync connectors
+      - ./connectors/readwise-reader.js:/app/dist/connectors/readwise-reader.js:ro
+      - ./connectors/refresh.js:/app/dist/connectors/refresh.js:ro
+    networks:
+      - media-network
+
+networks:
+  media-network:
+    external: true
+    name: ${DOCKER_NETWORK:-proxy}
