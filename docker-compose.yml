@@ -17,9 +17,11 @@ services:
       - READWISE_MATCH_THRESHOLD=${READWISE_MATCH_THRESHOLD:-0.7}
     volumes:
       - ${APP_DATA_DIR:-./data}:/data
-      # Mount enhanced 2-way sync connectors
+      # Mount enhanced 2-way sync connectors & KOReader progress sanitizer
       - ./connectors/readwise-reader.js:/app/dist/connectors/readwise-reader.js:ro
       - ./connectors/refresh.js:/app/dist/connectors/refresh.js:ro
+      - ./connectors/fanin.js:/app/dist/connectors/fanin.js:ro
+      - ./routes/kosync.js:/app/dist/routes/kosync.js:ro
     networks:
       - media-network
 

@@ -4,13 +4,23 @@ import { resolveMatch } from './runner.js';
 import { getAccount, getMatch } from './store.js';
 import { importBookorbitStats } from './bookorbit-stats.js';
 import { scheduleMicroblogClippings } from './microblog-clippings.js';
-
 /**
- * Per-book fan-in pullers consulted when a device asks for progress.
- * 
- * Includes `readwise-reader` with on-demand matching enabled so that
- * when a book is opened on CrossInk / CrossPoint, reading position is
- * pulled forward from Readwise Reader.
+ * Per-book fan-in pullers consulted when a device asks for progress. This
+ * runs alongside Jellyfin's and Spotify's hourly polls. BookOrbit also supports manual per-book
+ * sync; it does not poll in the background.
+ *
+ * strict:        a puller whose failure fails the progress GET (BookFusion: its
+ *                sidecar matches are treated as authoritative for the position).
+ *                Non-strict pullers (Kindle) are best-effort: a sick Amazon session
+ *                must never break a device's sync, so errors are logged and skipped.
+ * sidecarOnly:   only poll when the match came from the book's plugin sidecar.
+ * matchOnDemand: when no match exists yet, resolve one right here, so a read-only
+ *                connector still gets auto-matching without fan-out ever running.
+ *                Kindle's match searches the uploaded library snapshot plus the
+ *                cached purchased-book list; a cold cache costs one network fetch
+ *                inside the progress GET, bounded by the refresh deadline. A stale
+ *                'not found' is retried only when the credential (which carries
+ *                the library) was re-uploaded since.
  */
 const PER_BOOK_PULLERS = [
     { id: 'bookfusion', strict: true, sidecarOnly: true },
@@ -23,7 +33,6 @@ const PER_BOOK_PULLERS = [
     { id: 'seekquel', strict: false, sidecarOnly: false, matchOnDemand: true },
     { id: 'readest', strict: false, sidecarOnly: false, matchOnDemand: true },
 ];
-
 /** Shared by both progress endpoints; only overlapping requests share a refresh. */
 export function createProgressRefresh(db, http = fetchTransport) {
     const pending = new Map();
@@ -73,7 +82,7 @@ export function createProgressRefresh(db, http = fetchTransport) {
                 const error = new DOMException('Progress refresh timed out', 'TimeoutError');
                 controller.abort(error);
                 reject(error);
-            }, 10_000);
+            }, 2_000);
         });
         const bounded = (url, init) => {
             controller.signal.throwIfAborted();
@@ -93,6 +102,7 @@ export function createProgressRefresh(db, http = fetchTransport) {
                 void importBookorbitStats(db, userId, http, { document }).catch(() => { });
             }
         }, (error) => {
+            // Best-effort pullers must never fail the GET, not even by running out the clock.
             if (pullers.some((p) => p.strict))
                 throw error;
         }).finally(() => {
@@ -103,3 +113,4 @@ export function createProgressRefresh(db, http = fetchTransport) {
         return refresh;
     };
 }
+//# sourceMappingURL=refresh.js.map

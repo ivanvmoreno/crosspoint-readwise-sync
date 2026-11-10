@@ -1,63 +1,62 @@
 import { ConnectorOperationError } from './types.js';
 import { decideMatch, extractTitleAuthor } from './matching.js';
-
 /**
- * Readwise Reader connector (Tier 1) — 2-Way Reading Progress & Library Sync.
+ * Readwise Reader connector (Tier 1) — archive-on-finish.
  *
  * Distinct from the highlights-only `readwise` connector (classic /api/v2): this
- * connector carries reading *state* and *progress*.
- * 
- * Capabilities:
- * - Fan-out (Push): When a document is read or finished on the CrossInk / CrossPoint
- *   device, reading progress is sent to Readwise Reader API v3 (PATCH /api/v3/bulk_update/).
- * - Fan-in (Pull): When a book is opened on the device (or on demand), reading progress
- *   is retrieved from Readwise Reader so reading position resumes seamlessly.
- * - Rate Limiting & Caching: In-memory candidate pool with 10-minute TTL to safely
- *   adhere to Readwise's strict 20 req/min rate limit.
- * - Auto-Provisioning: If a book read on the e-reader does not yet exist in Readwise Reader,
- *   createBook automatically creates it via POST /api/v3/save/ with category 'epub'.
+ * one carries reading *state*. When a document is finished on the device, it
+ * marks the matching Readwise Reader document archived + seen via the Reader
+ * API v3 (`PATCH /api/v3/bulk_update/`). No highlights.
+ *
+ * Matching is by title/author metadata (the firmware sends the EPUB's title).
+ * It works with any source whose EPUB `dc:title` equals the Reader document's
+ * title; when the article is delivered by an OPDS bridge that copies the Readwise
+ * title verbatim the match is effectively exact — but we still gate on a high
+ * confidence so we never archive the wrong document.
+ *
+ * Reader API v3 (docs: readwise.io/reader_api): `GET /api/v3/list/` (paged,
+ * 20 req/min, `location`/`pageCursor`/`nextPageCursor`) and
+ * `PATCH /api/v3/bulk_update/` with `{ updates: [{ id, location, seen }] }`
+ * (returns 200, or 207 when some items failed — see push()).
  */
-
 const BASE = 'https://readwise.io/api/v3';
-
-// Non-archived locations = the pool of docs that could still be in progress.
+// Non-archived locations = the pool of docs that could still be "finished".
 const CANDIDATE_LOCATIONS = ['new', 'later', 'shortlist', 'feed', 'archive'];
-
-// Follow nextPageCursor to the end of each location; safety bound against loop
+// Follow nextPageCursor to the end of each location; this is just a safety bound
+// against a pathological cursor loop (a 429 mid-walk stops us far sooner and the
+// backfill/fan-in worker resumes after the cooldown).
 const MAX_CANDIDATE_PAGES = 50;
-
-// Tuned threshold: 0.7 accommodates slight edition variations, subtitles, and punctuation.
-const MATCH_THRESHOLD = Number(process.env.READWISE_MATCH_THRESHOLD ?? 0.7);
-
-// Rate-limit backoff. Readwise is 20 req/min per access token; on a 429 back off.
+// Archiving the wrong doc is worse than not archiving; our titles match ~1.0.
+const MATCH_THRESHOLD = 0.7;
+// Rate-limit backoff. Readwise is 20 req/min *per access token*; on a 429 we
+// can't read the exact Retry-After (crosspoint-sync's HttpTransport exposes no
+// response headers), so we approximate it: after a 429, skip that token's
+// Readwise calls for this window. Keyed per token so one account's 429 never
+// suppresses another's (crosspoint-sync is multi-user). The fan-in worker and
+// the queue retry after it clears.
 const COOLDOWN_MS = Number(process.env.READWISE_RATE_COOLDOWN_MS ?? 60_000);
 const rateLimitedUntil = new Map();
-
 function rateLimited(token) {
     const until = rateLimitedUntil.get(token) ?? 0;
     if (Date.now() < until)
         return true;
     if (until)
-        rateLimitedUntil.delete(token); // expired; keep map small
+        rateLimitedUntil.delete(token); // expired; keep the map small
     return false;
 }
-
 function noteRateLimit(token, status) {
     if (status === 429)
         rateLimitedUntil.set(token, Date.now() + COOLDOWN_MS);
 }
-
 function tokenOf(cred) {
     const t = cred.token;
     if (typeof t !== 'string' || t.length === 0)
         throw new Error('missing readwise token');
     return t;
 }
-
 function authHeaders(token) {
     return { authorization: `Token ${token}`, 'content-type': 'application/json' };
 }
-
 async function listDocs(token, http, location) {
     const out = [];
     let cursor;
@@ -79,6 +78,7 @@ async function listDocs(token, http, location) {
         const body = (await res.json());
         out.push(...(body.results ?? []));
         const next = body.nextPageCursor ?? undefined;
+        // Stop at the last page, or if the API ever repeats a cursor (loop guard).
         if (!next || seenCursors.has(next))
             break;
         seenCursors.add(next);
@@ -86,11 +86,9 @@ async function listDocs(token, http, location) {
     }
     return out;
 }
-
 let cachedPool = null;
 let cachedPoolTime = 0;
 const CACHE_TTL_MS = 10 * 60 * 1000;
-
 async function candidatePool(token, http) {
     if (cachedPool && (Date.now() - cachedPoolTime < CACHE_TTL_MS)) {
         return cachedPool;
@@ -111,7 +109,6 @@ async function candidatePool(token, http) {
     }
     return pool.length > 0 ? pool : (cachedPool ?? []);
 }
-
 async function validate(cred, http) {
     try {
         const res = await http(`${BASE}/list/?withHtmlContent=false`, {
@@ -128,12 +125,10 @@ async function validate(cred, http) {
         return { ok: false, error: err instanceof Error ? err.message : String(err) };
     }
 }
-
-/** Push progress updates and finished events. */
+/** Only act on finish — ignore ongoing progress so we don't churn the API. */
 function shouldPush(ev) {
     return ev.kind === 'finished' || ev.kind === 'progress';
 }
-
 async function match(cred, doc, http) {
     const token = tokenOf(cred);
     if (rateLimited(token))
@@ -153,16 +148,17 @@ async function match(cred, doc, http) {
         author: decision.best.author ?? null,
     };
 }
-
-/** The Reader candidate set used for matching. */
+/** The Reader "in progress" pool (non-archived), used as the match candidate set. */
 async function listCurrentlyReading(cred, http) {
     const pool = await candidatePool(tokenOf(cred), http);
     return pool.map((c) => ({ externalId: c.externalId, title: c.title, author: c.author ?? null }));
 }
-
 /**
- * Fan-in: pull the current Readwise reading position for a matched document.
- * If Readwise progress is ahead of device progress, Readwise position takes precedence.
+ * Fan-in: pull the current Readwise reading position for a matched document, so
+ * a half-read-in-Readwise article resumes on the device. Readwise exposes only a
+ * 0–1 `reading_progress` (no KOReader xpath), so we return the percentage; the
+ * exact-line seek is best-effort (crosspoint-sync fills a position from a prior
+ * device sample when it has one).
  */
 async function pullProgress(cred, match, http, sinceMs, extra) {
     const token = tokenOf(cred);
@@ -177,6 +173,8 @@ async function pullProgress(cred, match, http, sinceMs, extra) {
     if (!doc || typeof doc.reading_progress !== 'number')
         return null;
     const pct = Math.max(0, Math.min(1, doc.reading_progress));
+    // Always return a finite timestamp: a missing/unparseable updated_at falls
+    // back to "now" so the cursor comparison works and we never leak NaN.
     const parsed = doc.updated_at ? Date.parse(doc.updated_at) : NaN;
     let updatedAtMs = Number.isFinite(parsed) ? parsed : Date.now();
     let currentPct = 0;
@@ -191,7 +189,6 @@ async function pullProgress(cred, match, http, sinceMs, extra) {
     }
     return { externalId: match.externalId, percentage: pct, finished: pct >= 0.98, updatedAtMs };
 }
-
 async function push(cred, m, ev, http) {
     if (ev.kind !== 'finished' && ev.kind !== 'progress')
         return { ok: true };
@@ -213,17 +210,13 @@ async function push(cred, m, ev, http) {
     if (res.status >= 500)
         return { ok: false, retryable: true, error: `server ${res.status}` };
     if (res.status === 207) {
+        // Partial failure: the single item we sent didn't apply. Retry.
         return { ok: false, retryable: true, error: 'bulk_update partial failure' };
     }
     if (res.status >= 200 && res.status < 300)
         return { ok: true };
     return { ok: false, retryable: false, error: `unexpected status ${res.status}` };
 }
-
-/**
- * Auto-provision a missing book in Readwise Reader so newly opened books
- * on the e-reader get matched and synced to "Currently Reading" immediately.
- */
 async function createBook(cred, meta, ev, http) {
     const token = tokenOf(cred);
     if (rateLimited(token)) return null;
@@ -246,7 +239,7 @@ async function createBook(cred, meta, ev, http) {
         if (res.status === 200 || res.status === 201) {
             const data = await res.json();
             if (data?.id) {
-                cachedPool = null; // Invalidate pool cache so the newly saved item is discovered
+                cachedPool = null;
                 return {
                     externalId: data.id,
                     confidence: 1,
@@ -261,7 +254,6 @@ async function createBook(cred, meta, ev, http) {
     }
     return null;
 }
-
 export const readwiseReaderConnector = {
     id: 'readwise-reader',
     displayName: 'Readwise Reader',
@@ -279,3 +271,4 @@ export const readwiseReaderConnector = {
     listCurrentlyReading,
     createBook,
 };
+//# sourceMappingURL=readwise-reader.js.map
