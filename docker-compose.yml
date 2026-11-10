@@ -22,6 +22,7 @@ services:
       - ./connectors/refresh.js:/app/dist/connectors/refresh.js:ro
       - ./connectors/fanin.js:/app/dist/connectors/fanin.js:ro
       - ./routes/kosync.js:/app/dist/routes/kosync.js:ro
+      - ./routes/v1/stats.js:/app/dist/routes/v1/stats.js:ro
     networks:
       - media-network
 
